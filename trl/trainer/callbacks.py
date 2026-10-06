@@ -30,12 +30,16 @@ from transformers import (
     TrainingArguments,
 )
 from transformers.trainer_utils import has_length
-from transformers.utils import is_rich_available
+from transformers.utils import is_peft_available, is_rich_available
 
 from ..data_utils import maybe_apply_chat_template
 from ..import_utils import is_weave_available
 from ..models.utils import unwrap_model_for_generation
 from .utils import log_table_to_comet_experiment
+
+
+if is_peft_available():
+    from peft import PeftModel, get_peft_model
 
 
 if is_rich_available():
@@ -672,6 +676,7 @@ class BEMACallback(TrainerCallback):
         self.theta0_params = []  # θ₀ buffers (on self.device)
         self.ema_params = []  # EMA buffers (on self.device)
         self.running_model = None  # a copy of the model to run BEMA on
+        self.running_params = []  # running_model params matching thetat_params, by name
 
     @staticmethod
     def _unwrap_model(model):
@@ -701,9 +706,16 @@ class BEMACallback(TrainerCallback):
     ):
         model = self._unwrap_model(model)
 
-        # Create a new instance and load state_dict
-        self.running_model = type(model)(model.config).to(self.device)
+        # Create a new instance and load state_dict. For a PEFT model, `type(model)(model.config)` doesn't work,
+        # since `PeftModel.__init__` takes the base model and the adapter config, not just a config. Rebuild the
+        # base model instead and re-wrap it with the same adapter config.
+        if is_peft_available() and isinstance(model, PeftModel):
+            running_base_model = type(model.get_base_model())(model.config).to(self.device)
+            self.running_model = get_peft_model(running_base_model, model.peft_config[model.active_adapter])
+        else:
+            self.running_model = type(model)(model.config).to(self.device)
         self.running_model.load_state_dict(model.state_dict())
+        running_params = dict(self.running_model.named_parameters())
 
         # Cache trainable parameters once in a fixed order
         for name, param in model.named_parameters():
@@ -711,6 +723,7 @@ class BEMACallback(TrainerCallback):
                 continue
             self.param_names.append(name)
             self.thetat_params.append(param)
+            self.running_params.append(running_params[name])  # matching param on running_model, by name
 
             # Clone θ₀ and EMA on the same device as model
             theta0 = param.detach().clone().to(self.device)
@@ -732,7 +745,7 @@ class BEMACallback(TrainerCallback):
 
         # Compute EMA + BEMA in-place and write directly to running_model
         for thetat, theta0, ema, run_param in zip(
-            self.thetat_params, self.theta0_params, self.ema_params, self.running_model.parameters(), strict=True
+            self.thetat_params, self.theta0_params, self.ema_params, self.running_params, strict=True
         ):
             thetat = thetat.detach().to(self.device)
             ema.mul_(1 - beta).add_(thetat, alpha=beta)  # EMA update: ema = (1 - beta) * ema + beta * θₜ
